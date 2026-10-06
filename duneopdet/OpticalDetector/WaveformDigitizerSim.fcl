@@ -15,6 +15,7 @@ standard_daphne:
   BackTime:               0.386  
 
   Padding:              100      # ticks
+  MergeOverlappingRanges: true   # keep the focus ranges disjoint; false = legacy (stores samples twice under pile-up)
   ReadoutWindow:        320      # ticks
   PreTrigger:            20      # ticks
   Threshold:              1.5    # PE

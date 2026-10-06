@@ -54,11 +54,15 @@
 #include "CLHEP/Random/RandExponential.h"
 #include "CLHEP/Random/RandFlat.h"
 #include "CLHEP/Random/RandPoissonQ.h"
+#include "CLHEP/Random/RandBinomial.h"
 
 // C++ includes
 
 #include <vector>
 #include <map>
+#include <string>
+#include <unordered_map>
+#include <algorithm>
 #include <cmath>
 #include <memory>
 
@@ -82,6 +86,21 @@ namespace opdet {
       fhicl::Atom<double>         Correction          { Name("Correction"),          Comment("Adjust the amount of total light. Kept seprate from QE for clarity."), 1};
       fhicl::OptionalAtom<double> LateLightCorrection { Name("LateLightCorrection"), Comment("Adjust the amount of late light")};
       fhicl::OptionalAtom<double> LateLightBoundary   { Name("LateLightBoundary"),   Comment("Boundary that defines late light (ns)") };
+      fhicl::Atom<std::string>    LateLightReference  { Name("LateLightReference"),
+                                                        Comment("Time that late light is counted from, on each OpDet: \"Event\" = first photon of the "
+                                                                "whole event (legacy; with pile-up every later interaction's light is late), "
+                                                                "\"Track\" = first photon of the same track"),
+                                                        "Event" };
+      fhicl::Atom<bool>           DarkNoiseTimeInNs   { Name("DarkNoiseTimeInNs"),
+                                                        Comment("Store dark-count times in ns, like the photon times. false reproduces the legacy "
+                                                                "behaviour, which stores the us value as ns and puts every dark count within "
+                                                                "a few us of t = 0. Default true."),
+                                                        true };
+      fhicl::Atom<bool>           BinomialQE          { Name("BinomialQE"),
+                                                        Comment("Detect each photon of an SDP with probability QE (binomial). false reproduces the "
+                                                                "legacy Poisson(QE*n), which on top of PDFastSim's own Poisson draw inflates the PE "
+                                                                "variance and allows more PE than photons. Default true."),
+                                                        true };
 
     };
     using Parameters = art::EDProducer::Table<Config>;
@@ -105,12 +124,16 @@ namespace opdet {
     bool          fCorrectLateLight;    // Do we apply a late light correction?
     double        fLateLightCorrection; // How much to correct the late light
     double        fLateLightBoundary;   // What is the boundary which defines late light?
+    bool          fLateLightPerTrack;   // Is late light counted from each track's first photon (else the event's)?
+    bool          fDarkNoiseTimeInNs;   // Are dark-count times converted to ns (else legacy: us stored as ns)?
+    bool          fBinomialQE;          // Is detection binomial per photon (else legacy: Poisson on the mean)?
 
     // Random number engines
     CLHEP::HepRandomEngine& fSIPMEngine;
     CLHEP::RandExponential  fRandExponential;
     CLHEP::RandFlat         fRandFlat;
     CLHEP::RandPoissonQ     fRandPoissPhot;
+    CLHEP::RandBinomial     fRandBinomPhot;
   
     // Produce waveform on one of the optical detectors
     // These cannot be const due to the random number generators
@@ -151,6 +174,7 @@ namespace opdet {
     , fRandExponential(fSIPMEngine)
     , fRandFlat(fSIPMEngine)
     , fRandPoissPhot(fSIPMEngine)
+    , fRandBinomPhot(fSIPMEngine)
   {
 
     // This module produces (infrastructure piece)
@@ -215,6 +239,16 @@ namespace opdet {
         << "Leave both out to not adjust late light.\n";
     }
 
+    std::string const lateLightReference = config().LateLightReference();
+    if (lateLightReference != "Event" && lateLightReference != "Track") {
+      throw art::Exception(art::errors::Configuration)
+        << "LateLightReference: \"" << lateLightReference << "\"\n"
+        << "Must be \"Event\" or \"Track\".\n";
+    }
+    fLateLightPerTrack = (lateLightReference == "Track");
+    fDarkNoiseTimeInNs = config().DarkNoiseTimeInNs();
+    fBinomialQE        = config().BinomialQE();
+
     if (fCorrectLateLight && fLateLightCorrection*tempQE > LarProp->ScintPreScale())
     {
       throw art::Exception(art::errors::Configuration)
@@ -265,12 +299,24 @@ namespace opdet {
     if (btr.timePDclockSDPsMap().size() == 0)
       return;
 
-    // Get the earliest time in the BTR
-    double firstTime = btr.timePDclockSDPsMap()[0].first;
+    // Late light is light arriving more than fLateLightBoundary after a
+    // reference time on this OpDet. The BTR covers the whole event, so with
+    // pile-up the first photon of the event usually comes from an earlier
+    // interaction, and all light of the later ones, prompt included, counts
+    // as late. Per track, each track's light is counted from that track's
+    // first photon: tracks of one interaction start within ns of each other,
+    // and delayed processes (captures, decays) get their own reference.
+    double firstTime = 0.;
+    std::unordered_map<int, double> firstTimeOfTrack;
     if (fCorrectLateLight) {
-      for (auto time_sdps : btr.timePDclockSDPsMap()) {
-        double time = btr.timePDclockSDPsMap()[0].first;
+      firstTime = btr.timePDclockSDPsMap()[0].first;
+      for (auto const& [time, sdps]: btr.timePDclockSDPsMap()) {
         if (time < firstTime) firstTime = time;
+        if (!fLateLightPerTrack) continue;
+        for (auto const& sdp : sdps) {
+          auto const [it, inserted] = firstTimeOfTrack.try_emplace(sdp.trackID, time);
+          if (!inserted && time < it->second) it->second = time;
+        }
       }
     }
 
@@ -278,7 +324,7 @@ namespace opdet {
     for (auto const& [time, sdps]: btr.timePDclockSDPsMap()) {
 
       double lateScale = 1.;
-      if (fCorrectLateLight) {
+      if (fCorrectLateLight && !fLateLightPerTrack) {
         if (time > firstTime + fLateLightBoundary)
           lateScale = fLateLightCorrection;
       }
@@ -286,8 +332,20 @@ namespace opdet {
       // Loop through SDPs
       for(auto const& sdp : sdps) {
 
-        // Reduce true photons by QE, poisson-fluctuate
-        int nphot = fRandPoissPhot.fire(fQE * (double)sdp.numPhotons * lateScale);
+        if (fCorrectLateLight && fLateLightPerTrack)
+          lateScale = (time > firstTimeOfTrack.at(sdp.trackID) + fLateLightBoundary) ? fLateLightCorrection : 1.;
+
+        // Reduce true photons by QE. sdp.numPhotons is already a Poisson draw
+        // (PDFastSim), so each photon is detected with probability QE; a second
+        // Poisson draw on the mean would give Var/mean = 1+QE instead of 1-QE.
+        int nphot = 0;
+        if (fBinomialQE) {
+          double const p = std::min(1., fQE * lateScale);
+          if (sdp.numPhotons > 0)
+            nphot = static_cast<int>(fRandBinomPhot.fire(sdp.numPhotons, p));
+        }
+        else
+          nphot = fRandPoissPhot.fire(fQE * (double)sdp.numPhotons * lateScale);
 
         // For each true photon detected
         for(int truePh=0; truePh<nphot; ++truePh) {
@@ -326,7 +384,9 @@ namespace opdet {
 	    //Currently using all zeros as an indicator of Dark Noise for the trackID.
       int PE = 1+CrossTalk();
       for(int j = 0; j < PE; j++) {
-        dr_plusnoise.AddPhoton(dr_plusnoise.OpDetNum(), 0, darkNoiseTime);
+        // darkNoiseTime is in us (fTimeBegin, fTimeEnd, tau); DivRec times are ns
+        dr_plusnoise.AddPhoton(dr_plusnoise.OpDetNum(), 0,
+                               fDarkNoiseTimeInNs ? darkNoiseTime*1000. : darkNoiseTime);
       }
 
       // Find next time to simulate a single PE pulse

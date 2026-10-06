@@ -47,6 +47,7 @@
 #include "lardataobj/RawData/OpDetWaveform.h"
 #include "larana/OpticalDetector/OpHitFinder/AlgoSiPM.h"
 #include "duneopdet/OpticalDetector/AlgoSSPLeadingEdge.h"
+#include "duneopdet/OpticalDetector/FocusList.h"
 #include "dunecore/DuneObj/OpDetDivRec.h"
 #include "lardata/DetectorInfoServices/LArPropertiesService.h"
 #include "larcore/Geometry/WireReadout.h"
@@ -74,53 +75,6 @@ namespace opdet {
 
   using std::vector;
   using std::pair;
-  typedef std::vector< std::pair< size_t, size_t > > Ranges_t;
-
-  class FocusList
-  {
-  public:
-    FocusList(size_t nSamples, size_t padding)
-      : fNSamples(nSamples), fPadding(padding) 
-    {}
-
-    void AddRange(size_t from, size_t to)
-    {
-      from -= std::min(from, fPadding);
-      to   =  std::min(to+fPadding, fNSamples-1);
-
-      for(size_t i = 0; i < ranges.size(); ++i){
-        pair<size_t, size_t>& r = ranges[i];
-        // Completely nested, discard
-        if(from >= r.first && to <= r.second) return;
-        // Extend end
-        if(from >= r.first && from <= r.second){
-          r.second = to;
-          return;
-        }
-        // Extend front
-        if(to >= r.first && to <= r.second){
-          r.first = from;
-          return;
-        }
-      }
-      // Discontiguous, add
-      ranges.emplace_back(from, to);
-    }
-
-    void everything()
-    {
-      ranges.clear();
-      ranges.emplace_back(0, fNSamples-1);
-    }
-
-    
-    Ranges_t ranges;
-
-  protected:
-    size_t fNSamples;
-    size_t fPadding;
-  };
-
   class WaveformDigitizerSim : public art::EDProducer{
 
   public:
@@ -149,6 +103,10 @@ namespace opdet {
       // Waveform output Settings
       fhicl::Atom<size_t>            Padding             { Name("Padding"),
                                                            Comment("Minimum ticks around pulses to simulate")};
+      fhicl::Atom<bool>              MergeOverlappingRanges { Name("MergeOverlappingRanges"),
+                                                           Comment("Keep the focus ranges disjoint. false reproduces the legacy behaviour, "
+                                                                   "which stores samples twice where pulses pile up. Default true."),
+                                                           true };
       fhicl::Atom<size_t>            ReadoutWindow       { Name("ReadoutWindow"),
                                                            Comment("Total size of the triggered readout window in ticks")};
       fhicl::Atom<size_t>            PreTrigger          { Name("PreTrigger"),
@@ -198,6 +156,7 @@ namespace opdet {
 
     // Waveform output settings
     size_t  fPadding;
+    bool    fMergeOverlappingRanges;
     size_t  fReadoutWindow;
     size_t  fPreTrigger;
     double  fThresholdPE;
@@ -306,6 +265,7 @@ namespace opdet {
     , fBackTime{            config().BackTime() }
 
     , fPadding{             config().Padding() }
+    , fMergeOverlappingRanges{ config().MergeOverlappingRanges() }
     , fReadoutWindow{       config().ReadoutWindow() }
     , fPreTrigger{          config().PreTrigger() }
     , fThresholdPE{         config().Threshold() }
@@ -487,7 +447,7 @@ namespace opdet {
       // Create the vector (to address multiple readout channels per OpDet) of empty waveform vector and focus list
       std::vector< std::vector< double > > pdWaveforms(nChannelsPerOpDet,
                                                        std::vector< double >(nSamples, static_cast< double >(fPedestal)));
-      std::vector<FocusList> fls(nChannelsPerOpDet, FocusList(nSamples, fPadding));
+      std::vector<FocusList> fls(nChannelsPerOpDet, FocusList(nSamples, fPadding, fMergeOverlappingRanges));
 
       // Add a PE template to the waveform for each true photon
       for (auto dr_p: vDivRecs) AddPEsToWaveform(dr_p, nChannelsPerOpDet, pdWaveforms, fls);
@@ -607,7 +567,9 @@ namespace opdet {
           if (!fire) {
             // Start a new readout window 
             fire   = true;
-            wstart = tick-fPreTrigger;
+            // Clamp at the start of the waveform: tick-fPreTrigger would wrap
+            // around (size_t) for a trigger in the first fPreTrigger ticks
+            wstart = (tick >= fPreTrigger) ? tick-fPreTrigger : 0;
             wend   = tick-fPreTrigger+fReadoutWindow;
           }
           else {

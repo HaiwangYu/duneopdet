@@ -1,0 +1,1 @@
+cet_test(FocusList_test USE_BOOST_UNIT)

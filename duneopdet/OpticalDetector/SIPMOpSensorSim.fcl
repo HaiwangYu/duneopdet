@@ -7,6 +7,8 @@ xarapuca_ar:
   QuantumEfficiency: 0.030 # 3% X-ARAPUCA efficiency
   DarkNoiseRate:     10.0 # Hz
   CrossTalk:         0.20
+  DarkNoiseTimeInNs: true  # false = legacy: dark-count times in us stored as ns (all within a few us of t = 0)
+  BinomialQE:        true  # false = legacy: Poisson(QE*n) on top of PDFastSim's Poisson (PE variance too large)
 }
 
 xarapuca_ar_refl:                             @local::xarapuca_ar
@@ -24,6 +26,10 @@ xarapuca_ar_xe10ppm.InputTag:                "PDFastSimAr"
 xarapuca_ar_xe10ppm.Correction:              0.65
 xarapuca_ar_xe10ppm.LateLightCorrection:     0.31
 xarapuca_ar_xe10ppm.LateLightBoundary:       10   # ns
+# Late light is counted from the first photon on the OpDet of the whole event ("Event", legacy)
+# or of the same track ("Track"). With pile-up, "Event" treats all light of every interaction
+# after the first one on an OpDet, prompt included, as late.
+xarapuca_ar_xe10ppm.LateLightReference:      "Event"
 
 # Early light already disabled at PDFastSim stage
 # Correct down by 0.7 to account for remaining Ar late light
